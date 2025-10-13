@@ -1,5 +1,7 @@
 import { Client, GatewayIntentBits, SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
-import nodemailer from 'nodemailer';
+import { ClientSecretCredential } from "@azure/identity";
+import { TokenCredentialAuthenticationProvider } from '@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials';
+import { Client as GraphClient } from '@microsoft/microsoft-graph-client';
 import { config } from 'dotenv';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -10,10 +12,9 @@ config();
 
 export class EmailVerificationBot {
     private client: Client;
+    private graphClient!: GraphClient;
     private pendingVerifications: Map<string, VerificationData>;
     private rateLimits: Map<string, RateLimitData>;
-    private emailTransporter!: nodemailer.Transporter;
-    private readonly MAIL_DEBUG: boolean = ((process.env.MAIL_DEBUG || '').toLowerCase() === 'true' || process.env.MAIL_DEBUG === '1');
     private readonly RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
     private readonly MAX_ATTEMPTS_PER_WINDOW = 3;
     private readonly MAX_VERIFICATION_ATTEMPTS = 5;
@@ -31,7 +32,7 @@ export class EmailVerificationBot {
         this.pendingVerifications = new Map();
         this.rateLimits = new Map();
         this.initializeCsvFile();
-        this.setupEmailTransporter();
+        this.setupGraphClient();
         this.setupEventListeners();
     }
 
@@ -98,30 +99,48 @@ export class EmailVerificationBot {
         }
     }
 
-    private setupEmailTransporter() {
-        if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-            this.warn('EMAIL_USER or EMAIL_PASS not configured');
+    private setupGraphClient() {
+        if (!process.env.AZURE_TENANT_ID || !process.env.AZURE_CLIENT_ID) {
+            this.error('Azure tenant ID or client ID not configured');
+            return;
         }
 
-        const transportOptions: any = {
-            service: 'gmail',
-            auth: {
-                user: process.env.EMAIL_USER,
-                pass: process.env.EMAIL_PASS
-            },
-            logger: this.MAIL_DEBUG,
-            debug: this.MAIL_DEBUG
-        };
+        if (!process.env.AZURE_CLIENT_SECRET) {
+            this.error('Azure client secret not configured');
+            return;
+        }
+    
+        const credential = new ClientSecretCredential(
+            process.env.AZURE_TENANT_ID,
+            process.env.AZURE_CLIENT_ID,
+            process.env.AZURE_CLIENT_SECRET
+        );
+    
+        
+        const authProvider = new TokenCredentialAuthenticationProvider(credential, {
+            scopes: ["https://graph.microsoft.com/.default"]
+        });
+    
+        this.graphClient = GraphClient.initWithMiddleware({ authProvider });
+        this.log('✅ Microsoft Graph interactive authentication ready');
+    }
 
-        this.emailTransporter = nodemailer.createTransport(transportOptions);
-
-        // Verify SMTP connection early to surface auth/connectivity issues
-        this.emailTransporter.verify()
-            .then(() => this.log('✅ SMTP transporter verified'))
-            .catch((err) => this.error('SMTP transporter verification failed', {
-                message: (err as any)?.message,
-                code: (err as any)?.code
-            }));
+    private async testGraphConnection() {
+        try {
+            const senderEmail = process.env.AZURE_SENDER_EMAIL;
+            if (!senderEmail) {
+                this.warn('AZURE_SENDER_EMAIL not configured, skipping Graph connection test');
+                return;
+            }
+            
+            await this.graphClient
+                .api(`/users/${senderEmail}`)
+                .select('displayName,mail')
+                .get();
+            this.log('✅ Microsoft Graph connection verified');
+        } catch (error) {
+            this.error('Microsoft Graph connection verification failed', error);
+        }
     }
 
     private setupEventListeners() {
@@ -219,6 +238,7 @@ export class EmailVerificationBot {
             this.warn('Email domain not allowed', { userId, email });
             return;
         }
+        
         if (this.isEmailAlreadyVerified(email)) {
             await interaction.reply({
                 content: '❌ Cette adresse email a déjà été utilisée pour la vérification. Vous ne pouvez pas vérifier avec la même adresse email deux fois. Veuillez contacter un APE si vous avez besoin d\'aide.',
@@ -364,29 +384,47 @@ export class EmailVerificationBot {
     }
 
     private async sendVerificationEmail(email: string, code: string, username: string) {
-        let index = fs.readFileSync(path.join(__dirname, '../utils/index.html'), 'utf8');
-        index = index.replace('{{verificationCode}}', String(code));
-        index = index.replace('{{user}}', username);
-    
-        const mailOptions = {
-            from: `"Bachelor Verification Bot" <${process.env.EMAIL_USER}>`,
-            to: email,
+        const senderEmail = process.env.AZURE_SENDER_EMAIL;
+        if (!senderEmail) {
+            throw new Error('AZURE_SENDER_EMAIL is not configured');
+        }
+
+        let htmlContent = fs.readFileSync(path.join(__dirname, '../utils/index.html'), 'utf8');
+        htmlContent = htmlContent.replace('{{verificationCode}}', String(code));
+        htmlContent = htmlContent.replace('{{user}}', username);
+
+        const message = {
             subject: 'Vérification Email Serveur Discord',
-            text: `Voilà ton code de vérification: ${code}\nSi tu n'as pas demandé de code de vérification, la demande vient de l'utilisateur: ${username}.`,
-            html: index
+            body: {
+                contentType: 'HTML',
+                content: htmlContent
+            },
+            toRecipients: [
+                {
+                    emailAddress: {
+                        address: email
+                    }
+                }
+            ]
         };
 
-        this.log('Sending verification email', { to: email, from: process.env.EMAIL_USER });
-        const info = await this.emailTransporter!.sendMail(mailOptions);
-        this.log('Email sent via SMTP', {
-            messageId: (info as any)?.messageId,
-            accepted: (info as any)?.accepted,
-            rejected: (info as any)?.rejected,
-            response: (info as any)?.response
-        });
+        try {
+            this.log('Sending verification email via Microsoft Graph', { to: email, from: senderEmail });
+            
+            // For app-only auth, use /users/{id}/sendMail instead of /me/sendMail
+            await this.graphClient.api(`/users/${process.env.AZURE_SENDER_EMAIL}/sendMail`).post({
+                message: {
+                  subject: 'Vérification Discord',
+                  body: { contentType: 'HTML', content: htmlContent },
+                  toRecipients: [{ emailAddress: { address: email } }]
+                },
+                saveToSentItems: false
+              });
 
-        if ((info as any)?.rejected && (info as any).rejected.length > 0) {
-            this.warn('SMTP reported rejected recipients', { rejected: (info as any).rejected });
+            this.log('Email sent via Microsoft Graph', { to: email });
+        } catch (error) {
+            this.error('Failed to send email via Microsoft Graph', error);
+            throw error;
         }
     }
 
