@@ -1,18 +1,18 @@
 import { Client, GatewayIntentBits, SlashCommandBuilder, ChatInputCommandInteraction, GuildMember, MessageFlags } from 'discord.js';
-import { ClientSecretCredential } from "@azure/identity";
-import { TokenCredentialAuthenticationProvider } from '@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials';
 import { Client as GraphClient } from '@microsoft/microsoft-graph-client';
 import { config } from 'dotenv';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { VerificationData, RateLimitData } from '../types/interfaces';
+import { AuthService } from '../auth/AuthService';
 
 config();
 
 export class EmailVerificationBot {
     private client: Client;
     private graphClient!: GraphClient;
+    private authService: AuthService;
     private pendingVerifications: Map<string, VerificationData>;
     private rateLimits: Map<string, RateLimitData>;
     private readonly RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
@@ -20,7 +20,7 @@ export class EmailVerificationBot {
     private readonly MAX_VERIFICATION_ATTEMPTS = 5;
     private readonly CSV_FILE_PATH = path.join(process.cwd(), 'verified_emails.csv');
 
-    constructor() {
+    constructor(authService: AuthService) {
         this.client = new Client({
             intents: [
                 GatewayIntentBits.Guilds,
@@ -31,8 +31,9 @@ export class EmailVerificationBot {
 
         this.pendingVerifications = new Map();
         this.rateLimits = new Map();
+        this.authService = authService;
         this.initializeCsvFile();
-        this.setupGraphClient();
+        // Graph client will be lazily created once logged in
         this.setupEventListeners();
     }
 
@@ -99,52 +100,37 @@ export class EmailVerificationBot {
         }
     }
 
-    private setupGraphClient() {
-        if (!process.env.AZURE_TENANT_ID || !process.env.AZURE_CLIENT_ID) {
-            this.error('Azure tenant ID or client ID not configured');
-            return;
+    private async ensureGraphClient() {
+        if (this.graphClient) return;
+        const accessToken = await this.authService.getAccessToken();
+        if (!accessToken) {
+            throw new Error('Not logged in. Visit the auth server /login first.');
         }
-
-        if (!process.env.AZURE_CLIENT_SECRET) {
-            this.error('Azure client secret not configured');
-            return;
-        }
-    
-        const credential = new ClientSecretCredential(
-            process.env.AZURE_TENANT_ID,
-            process.env.AZURE_CLIENT_ID,
-            process.env.AZURE_CLIENT_SECRET
-        );
-    
-        
-        const authProvider = new TokenCredentialAuthenticationProvider(credential, {
-            scopes: ["https://graph.microsoft.com/.default"]
-        });
-    
-        this.graphClient = GraphClient.initWithMiddleware({ authProvider });
-        this.log('✅ Microsoft Graph interactive authentication ready');
+        this.graphClient = GraphClient.init({
+            authProvider: async (done: (error: any, token?: string) => void) => {
+                try {
+                    const token = await this.authService.getAccessToken();
+                    if (!token) return done(new Error('Missing access token'));
+                    return done(null, token);
+                } catch (e) {
+                    return done(e);
+                }
+            }
+        } as any);
+        this.log('✅ Microsoft Graph delegated auth ready');
     }
 
     private async testGraphConnection() {
         try {
-            const senderEmail = process.env.AZURE_SENDER_EMAIL;
-            if (!senderEmail) {
-                this.warn('AZURE_SENDER_EMAIL not configured, skipping Graph connection test');
-                return;
-            }
-            
-            await this.graphClient
-                .api(`/users/${senderEmail}`)
-                .select('displayName,mail')
-                .get();
-            this.log('✅ Microsoft Graph connection verified');
+            await this.ensureGraphClient();
+            this.log('✅ Microsoft Graph connection verified (delegated)');
         } catch (error) {
             this.error('Microsoft Graph connection verification failed', error);
         }
     }
 
     private setupEventListeners() {
-        this.client.once('clientReady', () => {
+        this.client.once('ready', () => {
             this.registerSlashCommands();
         });
 
@@ -187,6 +173,14 @@ export class EmailVerificationBot {
         const email = interaction.options.get('email')?.value as string;
         const userId = interaction.user.id;
         this.log('Received /verify command', { userId, email });
+
+        if (!this.authService.isLoggedIn()) {
+            await interaction.reply({
+                content: `🔐 L'authentification Microsoft n'est pas encore effectuée. Veuillez demander à l'administrateur de se connecter via ${process.env.APP_BASE_URL || 'http://localhost:3000'}/login`,
+                flags: MessageFlags.Ephemeral
+            });
+            return;
+        }
 
         const member = interaction.member as GuildMember;
         const roleName = process.env.VERIFIED_ROLE_NAME || 'Verified';
@@ -254,6 +248,7 @@ export class EmailVerificationBot {
         this.log('Generated verification code', { userId, email });
         
         try {
+            await this.ensureGraphClient();
             await this.sendVerificationEmail(email, verificationCode, interaction.user.username);
 
             this.pendingVerifications.set(userId, {
@@ -384,42 +379,33 @@ export class EmailVerificationBot {
     }
 
     private async sendVerificationEmail(email: string, code: string, username: string) {
-        const senderEmail = process.env.AZURE_SENDER_EMAIL;
-        if (!senderEmail) {
-            throw new Error('AZURE_SENDER_EMAIL is not configured');
-        }
-
-        let htmlContent = fs.readFileSync(path.join(__dirname, '../utils/index.html'), 'utf8');
+        const templateCandidates = [
+            path.join(__dirname, '../utils/index.html'), // when running from dist
+            path.join(process.cwd(), 'src', 'utils', 'index.html') // when running with ts-node
+        ];
+        let templatePath = templateCandidates.find(p => fs.existsSync(p));
+        let htmlContent = templatePath ? fs.readFileSync(templatePath, 'utf8') : `
+            <html>
+            <body>
+                <p>Bonjour {{user}},</p>
+                <p>Votre code de vérification est: <strong>{{verificationCode}}</strong></p>
+            </body>
+            </html>
+        `;
         htmlContent = htmlContent.replace('{{verificationCode}}', String(code));
         htmlContent = htmlContent.replace('{{user}}', username);
 
-        const message = {
-            subject: 'Vérification Email Serveur Discord',
-            body: {
-                contentType: 'HTML',
-                content: htmlContent
-            },
-            toRecipients: [
-                {
-                    emailAddress: {
-                        address: email
-                    }
-                }
-            ]
-        };
-
         try {
-            this.log('Sending verification email via Microsoft Graph', { to: email, from: senderEmail });
-            
-            // For app-only auth, use /users/{id}/sendMail instead of /me/sendMail
-            await this.graphClient.api(`/users/${process.env.AZURE_SENDER_EMAIL}/sendMail`).post({
+            this.log('Sending verification email via Microsoft Graph', { to: email });
+
+            await this.graphClient.api(`/me/sendMail`).post({
                 message: {
-                  subject: 'Vérification Discord',
-                  body: { contentType: 'HTML', content: htmlContent },
-                  toRecipients: [{ emailAddress: { address: email } }]
+                    subject: 'Vérification Discord',
+                    body: { contentType: 'HTML', content: htmlContent },
+                    toRecipients: [{ emailAddress: { address: email } }]
                 },
-                saveToSentItems: false
-              });
+                saveToSentItems: true
+            });
 
             this.log('Email sent via Microsoft Graph', { to: email });
         } catch (error) {
