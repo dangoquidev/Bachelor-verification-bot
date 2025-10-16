@@ -1,4 +1,3 @@
-version: '3.9'
 services:
   bach-bot:
     build: .
@@ -8,6 +7,4 @@ services:
       - .env
     ports:
       - "8000:8000"
-    volumes:
-      - ./verified_emails.csv:/app/verified_emails.csv
     command: ["node", "dist/index.js"]
