@@ -1,67 +1,67 @@
 # Bachelor Verification Bot
 
-Bot Discord de vérification des étudiants de première année d'Epitech : chaque nouvel arrivant prouve qu'il possède une adresse `@epitech.eu` avant d'accéder au serveur.
+Discord bot that verifies Epitech first-year students: every newcomer must prove they own an `@epitech.eu` address before getting access to the server.
 
-## Fonctionnement
+## How it works
 
-1. L'étudiant lance `/verify email:prenom.nom@epitech.eu` sur le serveur.
-2. Le bot envoie un code à 6 caractères par email, via **Microsoft Graph** (compte Microsoft 365 de l'école).
-3. L'étudiant colle le code dans le salon : le bot enregistre la vérification en base **MySQL**, lui attribue le rôle vérifié, le renomme `Prénom NOM` d'après son adresse, et supprime le message contenant le code.
+1. The student runs `/verify email:firstname.lastname@epitech.eu` on the server.
+2. The bot emails a 6-character code through **Microsoft Graph** (the school's Microsoft 365 account).
+3. The student pastes the code in the channel: the bot records the verification in **MySQL**, grants the verified role, renames the member `Firstname LASTNAME` from their address, and deletes the message containing the code.
 
 ```
-Discord ──/verify──▶ Bot ──Graph API /me/sendMail──▶ Boîte mail étudiant
+Discord ──/verify──▶ Bot ──Graph API /me/sendMail──▶ Student mailbox
    ▲                  │
-   └──── rôle + pseudo ◀── code saisi dans le salon
+   └── role + nickname ◀── code typed in the channel
 ```
 
-## Points techniques
+## Technical highlights
 
-- **OAuth2 délégué (MSAL)** : un petit serveur Express (`/login`, `/get_token`) permet à un administrateur de connecter le compte Microsoft qui envoie les emails ; les tokens sont rafraîchis silencieusement.
-- **Persistance MySQL** : table `verified_users` avec contrainte `UNIQUE` sur l'email, qui garantit qu'une adresse ne vérifie qu'un seul compte même en cas de requêtes concurrentes ; requêtes préparées via un pool `mysql2`, schéma créé au démarrage, import automatique de l'ancien fichier CSV.
-- **Anti-abus** : 3 demandes max par tranche de 15 minutes, 5 essais de code, expiration du code après 10 minutes, une adresse email ne peut vérifier qu'un seul compte Discord.
-- **Codes générés avec `crypto.randomInt`** (générateur cryptographique).
-- **Docker** : build multi-stage, exécution avec un utilisateur non-root, MySQL 8.4 dans Docker Compose avec healthcheck et volume persistant ; le bot attend que la base soit prête avant de démarrer.
-- Logs horodatés et structurés pour suivre chaque vérification.
+- **Delegated OAuth2 (MSAL)**: a small Express server (`/login`, `/get_token`) lets an admin sign in the Microsoft account that sends the emails; tokens are refreshed silently.
+- **MySQL persistence**: `verified_users` table with a `UNIQUE` constraint on the email, guaranteeing one address verifies only one Discord account even under concurrent requests; prepared statements through a `mysql2` pool, schema created at startup, automatic import of the legacy CSV file.
+- **Abuse protection**: max 3 requests per 15 minutes, 5 code attempts, codes expire after 10 minutes, one email address can only verify one Discord account.
+- **Codes generated with `crypto.randomInt`** (cryptographically secure RNG).
+- **Docker**: multi-stage build, runs as a non-root user, MySQL 8.4 in Docker Compose with a healthcheck and a persistent volume; the bot waits for the database before starting.
+- Timestamped, structured logs to trace every verification.
 
 ## Stack
 
 TypeScript · Node.js · discord.js v14 · Express · MySQL 8.4 · MSAL Node · Microsoft Graph · Docker Compose
 
-## Lancer le projet
+## Getting started
 
-Prérequis : une application Discord (bot) et une App Registration Azure AD avec la permission déléguée `Mail.Send`.
+Requirements: a Discord application (bot) and an Azure AD App Registration with the delegated `Mail.Send` permission.
 
 ```bash
-cp example.env .env   # renseigner les variables
+cp example.env .env   # fill in the variables
 docker compose up -d --build
 ```
 
-Puis ouvrir `http://localhost:8000/login` une fois pour connecter le compte Microsoft expéditeur.
+Then open `http://localhost:8000/login` once to sign in the sender Microsoft account.
 
-Sans Docker (nécessite un serveur MySQL accessible) :
+Without Docker (requires a reachable MySQL server):
 
 ```bash
 npm install
 npm run dev
 ```
 
-| Variable | Rôle |
+| Variable | Purpose |
 |---|---|
-| `DISCORD_TOKEN` | Token du bot Discord |
-| `VERIFIED_ROLE_NAME` | Nom du rôle attribué après vérification |
-| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | App Registration Azure AD |
-| `APP_BASE_URL`, `PORT`, `MSAL_REDIRECT_URI` | Serveur d'authentification |
-| `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD` | Connexion MySQL |
-| `MYSQL_ROOT_PASSWORD` | Mot de passe root du conteneur MySQL (Docker uniquement) |
+| `DISCORD_TOKEN` | Discord bot token |
+| `VERIFIED_ROLE_NAME` | Name of the role granted after verification |
+| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | Azure AD App Registration |
+| `APP_BASE_URL`, `PORT`, `MSAL_REDIRECT_URI` | Auth server |
+| `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_DATABASE`, `MYSQL_USER`, `MYSQL_PASSWORD` | MySQL connection |
+| `MYSQL_ROOT_PASSWORD` | Root password of the MySQL container (Docker only) |
 
-## Structure
+## Project structure
 
 ```
 src/
-├── index.ts                    # point d'entrée : serveur d'auth + bot
-├── server.ts                   # routes Express OAuth2
-├── auth/AuthService.ts         # MSAL : URL de login, échange du code, tokens
-├── bot/EmailVerificationBot.ts # commande /verify, codes, rôles, rate limiting
-├── db/VerificationStore.ts     # accès MySQL : schéma, lecture/écriture, import CSV
-└── utils/index.html            # template de l'email
+├── index.ts                    # entry point: auth server + bot
+├── server.ts                   # Express OAuth2 routes
+├── auth/AuthService.ts         # MSAL: login URL, code exchange, tokens
+├── bot/EmailVerificationBot.ts # /verify command, codes, roles, rate limiting
+├── db/VerificationStore.ts     # MySQL access: schema, reads/writes, CSV import
+└── utils/index.html            # email template
 ```
