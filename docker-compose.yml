@@ -1,10 +1,36 @@
 services:
+  db:
+    image: mysql:8.4
+    container_name: bach-bot-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   bach-bot:
     build: .
     container_name: bach-bot
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       - "8000:8000"
     command: ["node", "dist/index.js"]
+
+volumes:
+  mysql-data:

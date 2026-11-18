@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { VerificationData, RateLimitData } from '../types/interfaces';
 import { AuthService } from '../auth/AuthService';
+import { VerificationStore } from '../db/VerificationStore';
 
 config();
 
@@ -13,14 +14,14 @@ export class EmailVerificationBot {
     private client: Client;
     private graphClient!: GraphClient;
     private authService: AuthService;
+    private store: VerificationStore;
     private pendingVerifications: Map<string, VerificationData>;
     private rateLimits: Map<string, RateLimitData>;
     private readonly RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
     private readonly MAX_ATTEMPTS_PER_WINDOW = 3;
     private readonly MAX_VERIFICATION_ATTEMPTS = 5;
-    private readonly CSV_FILE_PATH = path.join(process.cwd(), 'verified_emails.csv');
 
-    constructor(authService: AuthService) {
+    constructor(authService: AuthService, store: VerificationStore) {
         this.client = new Client({
             intents: [
                 GatewayIntentBits.Guilds,
@@ -32,7 +33,7 @@ export class EmailVerificationBot {
         this.pendingVerifications = new Map();
         this.rateLimits = new Map();
         this.authService = authService;
-        this.initializeCsvFile();
+        this.store = store;
         // Graph client will be lazily created once logged in
         this.setupEventListeners();
     }
@@ -61,42 +62,6 @@ export class EmailVerificationBot {
             console.error(`[${ts}] ❌ ${message}`, details);
         } else {
             console.error(`[${ts}] ❌ ${message}`);
-        }
-    }
-
-    private initializeCsvFile() {
-        if (!fs.existsSync(this.CSV_FILE_PATH)) {
-            fs.writeFileSync(this.CSV_FILE_PATH, 'email,discord\n');
-            this.log('📄 Created verified_emails.csv file', { path: this.CSV_FILE_PATH });
-        }
-    }
-
-    private isEmailAlreadyVerified(email: string): boolean {
-        try {
-            const csvContent = fs.readFileSync(this.CSV_FILE_PATH, 'utf-8');
-            const lines = csvContent.split('\n').slice(1);
-            
-            for (const line of lines) {
-                if (line.trim()) {
-                    const [csvEmail] = line.split(',');
-                    if (csvEmail.toLowerCase() === email.toLowerCase()) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        } catch (error) {
-            this.error('Error reading CSV file', error);
-            return false;
-        }
-    }
-
-    private addEmailToVerifiedList(email: string, discordUsername: string) {
-        try {
-            const csvLine = `${email},${discordUsername}\n`;
-            fs.appendFileSync(this.CSV_FILE_PATH, csvLine);
-        } catch (error) {
-            this.error('Error writing to CSV file', error);
         }
     }
 
@@ -233,7 +198,19 @@ export class EmailVerificationBot {
             return;
         }
         
-        if (this.isEmailAlreadyVerified(email)) {
+        let alreadyVerified: boolean;
+        try {
+            alreadyVerified = await this.store.isEmailVerified(email);
+        } catch (error) {
+            this.error('Error querying verified users', error);
+            await interaction.reply({
+                content: '❌ Erreur interne. Veuillez réessayer plus tard.',
+                flags: MessageFlags.Ephemeral
+            });
+            return;
+        }
+
+        if (alreadyVerified) {
             await interaction.reply({
                 content: '❌ Cette adresse email a déjà été utilisée pour la vérification. Vous ne pouvez pas vérifier avec la même adresse email deux fois. Veuillez contacter un APE si vous avez besoin d\'aide.',
                 flags: MessageFlags.Ephemeral
@@ -336,13 +313,30 @@ export class EmailVerificationBot {
         this.log('Received verification code input', { userId: verification.userId, attempts: verification.attempts + 1 });
         
         if (inputCode === verification.code) {
-            await this.grantVerifiedRole(message.member);
-            
-            this.addEmailToVerifiedList(verification.email, message.author.username);
-
-            this.renameUserToRealName(message.member, verification.email);
-        
             this.pendingVerifications.delete(verification.userId);
+
+            // The UNIQUE constraint guards against two accounts racing with the same email
+            const saved = await this.store.addVerifiedUser({
+                email: verification.email,
+                discordId: message.author.id,
+                discordUsername: message.author.username
+            }).catch(error => {
+                this.error('Error saving verified user', error);
+                return null;
+            });
+            if (saved === null) {
+                await message.reply('❌ Erreur interne lors de la vérification. Veuillez réessayer plus tard.');
+                return;
+            }
+            if (!saved) {
+                await message.reply('❌ Cette adresse email a déjà été utilisée pour la vérification. Veuillez contacter un APE si vous avez besoin d\'aide.');
+                this.warn('Email already verified (race)', { userId: verification.userId, email: verification.email });
+                return;
+            }
+
+            await this.grantVerifiedRole(message.member);
+            this.renameUserToRealName(message.member, verification.email);
+
             await message.delete().catch(() => {});
             this.log('Verification successful', { userId: verification.userId, email: verification.email });
         } else {
