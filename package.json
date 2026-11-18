@@ -1,7 +1,7 @@
 {
-  "name": "discord-email-verification-bot",
+  "name": "bachelor-verification-bot",
   "version": "1.0.0",
-  "description": "A Discord bot that verifies users via email",
+  "description": "Discord bot verifying Epitech students via their @epitech.eu email (Microsoft Graph)",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
@@ -16,7 +16,7 @@
     "verification",
     "typescript"
   ],
-  "author": "Your Name",
+  "author": "Alexandre Pereira de Almeida",
   "license": "MIT",
   "dependencies": {
     "@azure/identity": "^4.13.0",
